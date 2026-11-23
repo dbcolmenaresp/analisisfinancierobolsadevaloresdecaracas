@@ -1,0 +1,554 @@
+import tkinter as tk
+from tkinter import ttk, messagebox
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+from matplotlib.figure import Figure
+import seaborn as sns
+from scipy import stats
+from datetime import datetime, timedelta
+import warnings
+warnings.filterwarnings("ignore")
+
+# --- Sentimiento ---
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+import nltk
+try:
+    nltk.data.find('sentiment/vader_lexicon')
+except LookupError:
+    nltk.download('vader_lexicon', quiet=True)
+
+# --- Indicadores técnicos ---
+import rhoa  # Ligero y con integración directa en pandas Series
+
+# ============================================================
+# CONFIGURACIÓN
+# ============================================================
+TICKERS_BVC = {
+    "BVCC.CR": "Financiero", "BVL.CR": "Financiero", "BPV.CR": "Financiero",
+    "ABC.A.CR": "Financiero", "BNC.CR": "Financiero", "MVZ.A.CR": "Financiero",
+    "CRM.A.CR": "Industrial", "DOM.CR": "Industrial", "ENV.CR": "Industrial",
+    "MPA.CR": "Industrial", "RST.B.CR": "Consumo", "SVS.CR": "Industrial",
+    "TDV.D.CR": "Telecomunicaciones", "CGQ.CR": "Químico",
+    "FNC.CR": "Construcción", "PTN.CR": "Agroindustria",
+    "GZL.CR": "Servicios", "PIV.B.CR": "Financiero",
+}
+PERIODOS = {"1 semana": "1wk", "1 mes": "1mo", "3 meses": "3mo",
+            "6 meses": "6mo", "1 año": "1y", "Todo": "max"}
+
+# Inicializar VADER una sola vez
+VADER = SentimentIntensityAnalyzer()
+
+# ============================================================
+# UTILIDADES DE NOTICIAS
+# ============================================================
+def extraer_titular(item: dict) -> str:
+    """
+    Extrae el título de una noticia de yfinance manejando ambos esquemas:
+    - Legacy: item["title"] (versiones < 1.8)
+    - Nuevo:  item["content"]["title"] (yfinance 1.8+)
+    Referencia: yfinance 1.8.0 anida los campos bajo "content"[reference:1].
+    """
+    if "content" in item and isinstance(item["content"], dict):
+        return item["content"].get("title", "").strip()
+    return item.get("title", "").strip()
+
+def extraer_fecha(item: dict) -> datetime | None:
+    """Devuelve la fecha de publicación de una noticia de yfinance."""
+    try:
+        if "content" in item and isinstance(item["content"], dict):
+            pub = item["content"].get("pubDate")
+            if pub:
+                return pd.to_datetime(pub).to_pydatetime()
+        ts = item.get("providerPublishTime")
+        if ts:
+            return datetime.fromtimestamp(ts)
+    except Exception:
+        pass
+    return None
+
+def analizar_sentimiento_titulares(titulares: list[str], usar_finbert: bool = False) -> list[float]:
+    """
+    Devuelve una lista de scores de sentimiento en [-1, 1] para cada titular.
+    Si usar_finbert=True, emplea ProsusAI/finbert (requiere transformers+torch).
+    Si no, usa VADER (rápido y sin dependencias pesadas).
+    """
+    if usar_finbert:
+        try:
+            from transformers import pipeline
+            clasificador = pipeline("text-classification", model="ProsusAI/finbert")
+            scores = []
+            for t in titulares:
+                res = clasificador(t, truncation=True, max_length=128)[0]
+                etiqueta, conf = res["label"].lower(), res["score"]
+                if "positive" in etiqueta:
+                    scores.append(conf)
+                elif "negative" in etiqueta:
+                    scores.append(-conf)
+                else:
+                    scores.append(0.0)
+            return scores
+        except Exception as e:
+            print(f"⚠️ FinBERT no disponible ({e}). Se usará VADER.")
+            # Fallback a VADER
+
+    # VADER por defecto
+    return [VADER.polarity_scores(t)["compound"] for t in titulares]
+
+# ============================================================
+# INDICADORES TÉCNICOS
+# ============================================================
+def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Añade columnas de indicadores técnicos al DataFrame OHLCV.
+    Usa la librería 'rhoa' para RSI, MACD, Bollinger y ADX.
+    ATR se calcula manualmente (Wilder) para mayor control.
+    """
+    df = df.copy()
+    close = df["Close"]
+
+    # RSI (14)
+    df["RSI_14"] = close.rhoa.indicators.rsi(window_size=14)
+
+    # MACD (12, 26, 9)
+    macd_data = close.rhoa.indicators.macd()
+    df["MACD"] = macd_data["macd"]
+    df["MACD_Signal"] = macd_data["signal"]
+    df["MACD_Hist"] = df["MACD"] - df["MACD_Signal"]
+
+    # Bandas de Bollinger (20, 2)
+    bb = close.rhoa.indicators.bollinger_bands(window_size=20, num_std=2.0)
+    df["BB_Upper"] = bb["upper_band"]
+    df["BB_Lower"] = bb["lower_band"]
+    df["BB_Mid"] = (df["BB_Upper"] + df["BB_Lower"]) / 2
+
+    # ADX (14) — requiere High, Low, Close
+    try:
+        df["ADX_14"] = df.rhoa.indicators.adx(window_size=14)
+    except Exception:
+        df["ADX_14"] = np.nan
+
+    # ATR (14) — cálculo manual (Wilder smoothing)
+    high, low, close_prev = df["High"], df["Low"], df["Close"].shift(1)
+    tr = pd.concat([high - low,
+                    (high - close_prev).abs(),
+                    (low - close_prev).abs()], axis=1).max(axis=1)
+    df["ATR_14"] = tr.ewm(alpha=1/14, adjust=False).mean()
+
+    return df
+
+def señal_compuesta(df: pd.DataFrame, sentimiento_prom: float = 0.0) -> dict:
+    """
+    Combina tendencia (pendiente), momentum (RSI, MACD) y sentimiento
+    en una señal discreta. Devuelve un dict con el score y la etiqueta.
+    """
+    if df.empty or len(df) < 50:
+        return {"score": 0, "etiqueta": "Datos insuficientes"}
+
+    ultimo = df.iloc[-1]
+    score = 0
+
+    # 1. Tendencia: pendiente de los últimos 50 días
+    idx = np.arange(len(df.tail(50)))
+    pendiente, _, _, _, _ = stats.linregress(idx, df["Close"].tail(50).values)
+    if pendiente > 0:
+        score += 1
+    elif pendiente < 0:
+        score -= 1
+
+    # 2. RSI
+    rsi = ultimo.get("RSI_14", np.nan)
+    if pd.notna(rsi):
+        if rsi < 30:
+            score += 1   # sobreventa → posible rebote
+        elif rsi > 70:
+            score -= 1   # sobrecompra → posible corrección
+
+    # 3. MACD
+    if ultimo.get("MACD_Hist", 0) > 0:
+        score += 1
+    elif ultimo.get("MACD_Hist", 0) < 0:
+        score -= 1
+
+    # 4. Sentimiento de noticias
+    if sentimiento_prom > 0.15:
+        score += 1
+    elif sentimiento_prom < -0.15:
+        score -= 1
+
+    etiqueta = ("Alcista fuerte" if score >= 3 else
+                "Alcista" if score >= 1 else
+                "Bajista fuerte" if score <= -3 else
+                "Bajista" if score <= -1 else "Neutral")
+
+    return {"score": score, "etiqueta": etiqueta}
+
+# ============================================================
+# CLASE PRINCIPAL TKINTER
+# ============================================================
+class AnalizadorBVC(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("📈 Analizador BVC — Noticias + Indicadores + Mochila 0/1")
+        self._configurar_resolucion()
+        self._configurar_estilos()
+        self._construir_ui()
+
+    def _configurar_resolucion(self):
+        aw, ah = self.winfo_screenwidth(), self.winfo_screenheight()
+        self.factor = max(0.7, min(min(aw/1920, ah/1080), 1.6))
+        vw, vh = int(aw*0.88), int(ah*0.88)
+        self.geometry(f"{vw}x{vh}+{int(aw*0.06)}+{int(ah*0.06)}")
+        self.minsize(int(900*self.factor), int(600*self.factor))
+
+    def _configurar_estilos(self):
+        f = self.factor
+        s = ttk.Style(self)
+        s.theme_use("clam")
+        for est, size in [("TLabel",10),("TButton",10),("TNotebook.Tab",10),
+                          ("TCombobox",10),("TEntry",10)]:
+            s.configure(est, font=("Segoe UI", int(size*f)),
+                        padding=int(6*f) if est == "TButton" else 0)
+        s.configure("Treeview", font=("Segoe UI", int(9*f)), rowheight=int(24*f))
+        s.configure("Treeview.Heading", font=("Segoe UI", int(10*f), "bold"))
+
+    def _construir_ui(self):
+        nb = ttk.Notebook(self)
+        nb.pack(fill="both", expand=True, padx=int(8*self.factor), pady=int(8*self.factor))
+
+        self.tab_ticker = ttk.Frame(nb); nb.add(self.tab_ticker, text="📊 Ticker + Noticias")
+        self._construir_tab_ticker(self.tab_ticker)
+
+        self.tab_comp = ttk.Frame(nb); nb.add(self.tab_comp, text="🔄 Comparar (≤4)")
+        self._construir_tab_comparar(self.tab_comp)
+
+        self.tab_corr = ttk.Frame(nb); nb.add(self.tab_corr, text="🔗 Correlación")
+        self._construir_tab_corr(self.tab_corr)
+
+        self.tab_mochila = ttk.Frame(nb); nb.add(self.tab_mochila, text="🎒 Portafolio (Mochila)")
+        self._construir_tab_mochila(self.tab_mochila)
+
+    # ----------------------------------------------------------
+    # PESTAÑA 1: TICKER + NOTICIAS + INDICADORES
+    # ----------------------------------------------------------
+    def _construir_tab_ticker(self, parent):
+        f = self.factor
+        ctrl = ttk.Frame(parent); ctrl.pack(fill="x", padx=int(10*f), pady=int(8*f))
+
+        ttk.Label(ctrl, text="Ticker:").pack(side="left")
+        self.entry_ticker = ttk.Entry(ctrl, width=int(12*f)); self.entry_ticker.pack(side="left", padx=int(4*f))
+        self.entry_ticker.insert(0, "BVCC.CR")
+
+        ttk.Label(ctrl, text="Período:").pack(side="left", padx=(int(10*f), int(4*f)))
+        self.combo_per = ttk.Combobox(ctrl, values=list(PERIODOS.keys()), state="readonly", width=int(12*f))
+        self.combo_per.pack(side="left"); self.combo_per.set("1 año")
+
+        ttk.Label(ctrl, text="Sentimiento:").pack(side="left", padx=(int(10*f), int(4*f)))
+        self.combo_sent = ttk.Combobox(ctrl, values=["VADER (rápido)", "FinBERT (preciso)"],
+                                       state="readonly", width=int(16*f))
+        self.combo_sent.pack(side="left"); self.combo_sent.set("VADER (rápido)")
+
+        ttk.Button(ctrl, text="Analizar", command=self._analizar_ticker).pack(side="left", padx=int(8*f))
+
+        # Panel dividido: gráfico a la izquierda, noticias a la derecha
+        paned = ttk.PanedWindow(parent, orient="horizontal")
+        paned.pack(fill="both", expand=True, padx=int(10*f), pady=int(4*f))
+
+        self.frame_grafico = ttk.Frame(paned)
+        paned.add(self.frame_grafico, weight=3)
+
+        frame_noticias = ttk.Frame(paned)
+        paned.add(frame_noticias, weight=1)
+
+        ttk.Label(frame_noticias, text="📰 Titulares recientes", font=("Segoe UI", int(11*f), "bold")).pack(anchor="w")
+        self.text_noticias = tk.Text(frame_noticias, wrap="word", font=("Segoe UI", int(9*f)),
+                                     state="disabled", bg="#fafafa")
+        self.text_noticias.pack(fill="both", expand=True, pady=(int(4*f), 0))
+
+        self.text_resumen = tk.Text(parent, height=int(7*f), wrap="word",
+                                    font=("Consolas", int(9*f)), bg="#f4f4f4")
+        self.text_resumen.pack(fill="x", padx=int(10*f), pady=(0, int(8*f)))
+
+    def _analizar_ticker(self):
+        ticker = self.entry_ticker.get().strip().upper()
+        periodo = PERIODOS.get(self.combo_per.get(), "1y")
+        usar_finbert = self.combo_sent.get().startswith("FinBERT")
+
+        df = self._descargar(ticker, periodo)
+        if df.empty:
+            return
+
+        df = calcular_indicadores(df)
+
+        # --- Noticias y sentimiento ---
+        titulares, scores = self._obtener_noticias(ticker, usar_finbert)
+        sentimiento_prom = float(np.mean(scores)) if scores else 0.0
+
+        # --- Gráfico con indicadores ---
+        self._graficar_ticker_con_indicadores(ticker, df, periodo, sentimiento_prom)
+
+        # --- Panel de noticias ---
+        self.text_noticias.config(state="normal")
+        self.text_noticias.delete("1.0", "end")
+        if titulares:
+            for t, s in zip(titulares, scores):
+                emoji = "🟢" if s > 0.15 else "🔴" if s < -0.15 else "⚪"
+                self.text_noticias.insert("end", f"{emoji} [{s:+.2f}] {t}\n\n")
+        else:
+            self.text_noticias.insert("end", "No se encontraron noticias para este ticker.\n"
+                                           "La cobertura de Yahoo Finance para la BVC es limitada.")
+        self.text_noticias.config(state="disabled")
+
+        # --- Resumen y señal compuesta ---
+        señal = señal_compuesta(df, sentimiento_prom)
+        ultimo = df.iloc[-1]
+        resumen = (
+            f"Ticker: {ticker}  |  Período: {periodo}\n"
+            f"Precio actual: {ultimo['Close']:,.2f} Bs.\n"
+            f"RSI(14): {ultimo.get('RSI_14', np.nan):.1f}  |  "
+            f"MACD Hist: {ultimo.get('MACD_Hist', np.nan):+.4f}\n"
+            f"ADX(14): {ultimo.get('ADX_14', np.nan):.1f}  |  "
+            f"ATR(14): {ultimo.get('ATR_14', np.nan):,.2f}\n"
+            f"Sentimiento promedio: {sentimiento_prom:+.3f}  "
+            f"({len(scores)} noticias analizadas)\n"
+            f"→ SEÑAL COMPUESTA: {señal['etiqueta']} (score={señal['score']})"
+        )
+        self.text_resumen.delete("1.0", "end")
+        self.text_resumen.insert("1.0", resumen)
+
+    def _graficar_ticker_con_indicadores(self, ticker, df, periodo_nombre, sentimiento_prom):
+        fig = Figure(figsize=(10, 6.5), dpi=100)
+        ax = fig.add_subplot(211)
+        ax2 = fig.add_subplot(212)
+
+        # Panel superior: precio + Bollinger + MM
+        ax.plot(df.index, df["Close"], label="Cierre", color="steelblue", lw=1.4)
+        ax.plot(df.index, df["BB_Upper"], color="gray", ls="--", alpha=0.6, label="BB Sup")
+        ax.plot(df.index, df["BB_Lower"], color="gray", ls="--", alpha=0.6, label="BB Inf")
+        ax.fill_between(df.index, df["BB_Lower"], df["BB_Upper"], color="gray", alpha=0.08)
+
+        # Proyección lineal (como referencia)
+        idx = np.arange(len(df))
+        pend, inter, r_val, _, _ = stats.linregress(idx, df["Close"])
+        dias_fut = 30
+        fut_idx = np.arange(len(df), len(df)+dias_fut)
+        fut_fechas = pd.bdate_range(df.index[-1]+timedelta(days=1), periods=dias_fut)
+        ax.plot(fut_fechas, inter + pend*fut_idx, color="purple", ls="-.",
+                lw=1.8, label="Proyección 30d")
+
+        ax.set_title(f"{ticker} — Precio, Bollinger y proyección ({periodo_nombre})", fontsize=10)
+        ax.legend(fontsize=7, loc="upper left")
+        ax.grid(alpha=0.25)
+
+        # Panel inferior: RSI y MACD en ejes secundarios
+        ax2.plot(df.index, df["RSI_14"], color="orange", lw=1.2, label="RSI(14)")
+        ax2.axhline(70, color="red", ls=":", alpha=0.6)
+        ax2.axhline(30, color="green", ls=":", alpha=0.6)
+        ax2.set_ylabel("RSI", color="orange")
+        ax2.tick_params(axis="y", labelcolor="orange")
+        ax2.grid(alpha=0.2)
+
+        ax3 = ax2.twinx()
+        ax3.bar(df.index, df["MACD_Hist"], color="gray", alpha=0.4, width=1.0, label="MACD Hist")
+        ax3.plot(df.index, df["MACD"], color="blue", lw=0.9, alpha=0.7, label="MACD")
+        ax3.plot(df.index, df["MACD_Signal"], color="red", lw=0.9, alpha=0.7, label="Señal")
+        ax3.set_ylabel("MACD", color="blue")
+        ax3.tick_params(axis="y", labelcolor="blue")
+
+        # Líneas de sentimiento como texto en el gráfico
+        ax2.text(0.01, 0.95, f"Sentimiento noticias: {sentimiento_prom:+.2f}",
+                 transform=ax2.transAxes, fontsize=8, va="top",
+                 bbox=dict(boxstyle="round", facecolor="white", alpha=0.8))
+
+        fig.tight_layout()
+        self._mostrar_figura(fig, self.frame_grafico)
+
+    def _obtener_noticias(self, ticker, usar_finbert):
+        try:
+            items = yf.Ticker(ticker).news or []
+        except Exception:
+            return [], []
+
+        titulares, scores = [], []
+        for item in items[:15]:  # máximo 15 noticias
+            titulo = extraer_titular(item)
+            if not titulo:
+                continue
+            titulares.append(titulo)
+        if titulares:
+            scores = analizar_sentimiento_titulares(titulares, usar_finbert)
+        return titulares, scores
+
+    # ----------------------------------------------------------
+    # PESTAÑA 2: COMPARACIÓN (sin cambios mayores)
+    # ----------------------------------------------------------
+    def _construir_tab_comparar(self, parent):
+        f = self.factor
+        ctrl = ttk.Frame(parent); ctrl.pack(fill="x", padx=int(10*f), pady=int(8*f))
+        ttk.Label(ctrl, text="Tickers (coma, máx. 4):").pack(side="left")
+        self.entry_comp = ttk.Entry(ctrl, width=int(45*f)); self.entry_comp.pack(side="left", padx=int(6*f))
+        self.entry_comp.insert(0, "BVCC.CR,BVL.CR,BPV.CR,CRM.A.CR")
+        ttk.Label(ctrl, text="Período:").pack(side="left", padx=(int(10*f), int(4*f)))
+        self.combo_comp_per = ttk.Combobox(ctrl, values=list(PERIODOS.keys()), state="readonly", width=int(12*f))
+        self.combo_comp_per.pack(side="left"); self.combo_comp_per.set("1 año")
+        ttk.Button(ctrl, text="Comparar", command=self._comparar).pack(side="left", padx=int(6*f))
+        self.frame_comp = ttk.Frame(parent); self.frame_comp.pack(fill="both", expand=True, padx=int(10*f))
+
+    def _comparar(self):
+        tickers = [t.strip().upper() for t in self.entry_comp.get().split(",") if t.strip()][:4]
+        periodo = PERIODOS.get(self.combo_comp_per.get(), "1y")
+        datos = {}
+        for t in tickers:
+            df = self._descargar(t, periodo)
+            if not df.empty:
+                datos[t] = df["Close"]
+        if not datos:
+            return
+        dfc = pd.DataFrame(datos).dropna()
+        dfn = (dfc / dfc.iloc[0]) * 100
+        fig = Figure(figsize=(10, 5), dpi=100)
+        ax = fig.add_subplot(111)
+        for c in dfn.columns:
+            ax.plot(dfn.index, dfn[c], label=c, lw=1.6)
+        ax.set_title("Rendimiento relativo (base 100)", fontsize=11)
+        ax.legend(fontsize=8); ax.grid(alpha=0.25); fig.tight_layout()
+        self._mostrar_figura(fig, self.frame_comp)
+
+    # ----------------------------------------------------------
+    # PESTAÑA 3: CORRELACIÓN (sin cambios)
+    # ----------------------------------------------------------
+    def _construir_tab_corr(self, parent):
+        f = self.factor
+        ctrl = ttk.Frame(parent); ctrl.pack(fill="x", padx=int(10*f), pady=int(8*f))
+        ttk.Label(ctrl, text="Tickers (coma, mín. 2):").pack(side="left")
+        self.entry_corr = ttk.Entry(ctrl, width=int(50*f)); self.entry_corr.pack(side="left", padx=int(6*f))
+        self.entry_corr.insert(0, "BVCC.CR,BVL.CR,BPV.CR,CRM.A.CR")
+        ttk.Button(ctrl, text="Calcular correlación", command=self._correlacion).pack(side="left", padx=int(6*f))
+        self.frame_corr = ttk.Frame(parent); self.frame_corr.pack(fill="both", expand=True, padx=int(10*f))
+
+    def _correlacion(self):
+        tickers = [t.strip().upper() for t in self.entry_corr.get().split(",") if t.strip()]
+        datos = {}
+        for t in tickers:
+            df = self._descargar(t, "1y")
+            if not df.empty:
+                datos[t] = df["Close"].pct_change().dropna()
+        if len(datos) < 2:
+            messagebox.showwarning("Datos", "Se necesitan al menos 2 tickers.")
+            return
+        corr = pd.DataFrame(datos).dropna().corr()
+        fig = Figure(figsize=(8, 6), dpi=100)
+        ax = fig.add_subplot(111)
+        sns.heatmap(corr, annot=True, fmt=".2f", cmap="RdYlGn_r", vmin=-1, vmax=1,
+                    square=True, ax=ax, annot_kws={"size": 8})
+        ax.set_title("Correlación de retornos diarios", fontsize=11)
+        fig.tight_layout(); self._mostrar_figura(fig, self.frame_corr)
+
+    # ----------------------------------------------------------
+    # PESTAÑA 4: MOCHILA (sin cambios funcionales)
+    # ----------------------------------------------------------
+    def _construir_tab_mochila(self, parent):
+        f = self.factor
+        ctrl = ttk.Frame(parent); ctrl.pack(fill="x", padx=int(10*f), pady=int(8*f))
+        ttk.Label(ctrl, text="Presupuesto (Bs.):").pack(side="left")
+        self.entry_pres = ttk.Entry(ctrl, width=int(15*f)); self.entry_pres.pack(side="left", padx=int(6*f))
+        self.entry_pres.insert(0, "100000")
+        ttk.Label(ctrl, text="Período:").pack(side="left", padx=(int(10*f), int(4*f)))
+        self.combo_moch_per = ttk.Combobox(ctrl, values=["1 mes","3 meses","6 meses","1 año","Todo"],
+                                           state="readonly", width=int(12*f))
+        self.combo_moch_per.pack(side="left"); self.combo_moch_per.set("1 año")
+        ttk.Button(ctrl, text="Optimizar", command=self._mochila).pack(side="left", padx=int(6*f))
+        self.frame_moch = ttk.Frame(parent); self.frame_moch.pack(fill="both", expand=True, padx=int(10*f))
+        self.tree_moch = ttk.Treeview(self.frame_moch,
+                                      columns=("ticker","sector","precio","sharpe"),
+                                      show="headings", height=int(8*f))
+        for c, txt in zip(("ticker","sector","precio","sharpe"),
+                          ("Ticker","Sector","Precio","Sharpe")):
+            self.tree_moch.heading(c, text=txt)
+            self.tree_moch.column(c, width=int(120*f), anchor="center")
+        self.tree_moch.pack(fill="both", expand=True)
+
+    def _mochila(self):
+        try:
+            presup = float(self.entry_pres.get().replace(",", ""))
+        except ValueError:
+            messagebox.showerror("Error", "Presupuesto inválido.")
+            return
+        per_map = {"1 mes":"1mo","3 meses":"3mo","6 meses":"6mo","1 año":"1y","Todo":"max"}
+        periodo = per_map.get(self.combo_moch_per.get(), "1y")
+        regs = []
+        for tk, sec in TICKERS_BVC.items():
+            df = self._descargar(tk, periodo)
+            if df.empty or len(df) < 30:
+                continue
+            r = df["Close"].pct_change().dropna()
+            if len(r) < 20 or r.std() == 0:
+                continue
+            regs.append({"ticker": tk, "sector": sec,
+                         "precio": float(df["Close"].iloc[-1]),
+                         "sharpe": float(r.mean()/r.std())})
+        if not regs:
+            messagebox.showwarning("Datos", "Sin datos suficientes.")
+            return
+        dfr = pd.DataFrame(regs)
+        dfm = dfr.loc[dfr.groupby("sector")["sharpe"].idxmax()].reset_index(drop=True)
+        sel, _ = self._knapsack(dfm["precio"].tolist(), dfm["sharpe"].tolist(), presup)
+        for row in self.tree_moch.get_children():
+            self.tree_moch.delete(row)
+        if not sel:
+            messagebox.showinfo("Sin selección", f"Con {presup:,.2f} Bs. no alcanza.")
+            return
+        elegidas = dfm.iloc[sel]
+        for _, r in elegidas.iterrows():
+            self.tree_moch.insert("", "end", values=(r["ticker"], r["sector"],
+                                                     f"{r['precio']:,.2f}", f"{r['sharpe']:.4f}"))
+        costo = elegidas["precio"].sum()
+        messagebox.showinfo("Portafolio",
+                            f"Costo: {costo:,.2f} Bs.\nRestante: {presup-costo:,.2f} Bs.\n"
+                            f"Sectores: {', '.join(elegidas['sector'].unique())}")
+
+    @staticmethod
+    def _knapsack(pesos, valores, cap):
+        esc = 100
+        pi = [int(round(p*esc)) for p in pesos]
+        ci = int(round(cap*esc))
+        n = len(pesos)
+        dp = [[0]*(ci+1) for _ in range(n+1)]
+        for i in range(1, n+1):
+            for w in range(ci+1):
+                dp[i][w] = max(dp[i-1][w],
+                               dp[i-1][w-pi[i-1]] + valores[i-1]) if pi[i-1] <= w else dp[i-1][w]
+        sel, w = [], ci
+        for i in range(n, 0, -1):
+            if dp[i][w] != dp[i-1][w]:
+                sel.append(i-1); w -= pi[i-1]
+        return sel[::-1], dp[n][ci]
+
+    # ----------------------------------------------------------
+    # UTILIDADES GENERALES
+    # ----------------------------------------------------------
+    def _descargar(self, ticker, periodo):
+        try:
+            d = yf.download(ticker, period=periodo, progress=False, auto_adjust=True)
+            if d.empty:
+                messagebox.showwarning("Sin datos", f"{ticker} no devolvió datos.")
+                return pd.DataFrame()
+            if isinstance(d.columns, pd.MultiIndex):
+                d.columns = d.columns.get_level_values(0)
+            return d
+        except Exception as e:
+            messagebox.showerror("Error", f"{ticker}: {e}")
+            return pd.DataFrame()
+
+    def _mostrar_figura(self, fig, frame):
+        for w in frame.winfo_children():
+            w.destroy()
+        canvas = FigureCanvasTkAgg(fig, master=frame)
+        canvas.draw()
+        NavigationToolbar2Tk(canvas, frame).update()
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+
+if __name__ == "__main__":
+    AnalizadorBVC().mainloop()
